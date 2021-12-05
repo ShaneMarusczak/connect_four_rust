@@ -9,7 +9,7 @@ const YELLOW_WIN: isize = 100000;
 
 const NOCOL: usize = 99;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct Board {
     array: [[usize; COLS]; ROWS],
 }
@@ -37,6 +37,7 @@ fn main() {
     };
 
     let mut game = game_init(depth);
+    print_board(&game.board);
 
     loop {
         println!("Which column to play token?");
@@ -46,14 +47,25 @@ fn main() {
             .read_line(&mut col_input)
             .expect("Failed to read line");
 
-        let col_input: usize = match col_input.trim().parse() {
+        let col: usize = match col_input.trim().parse() {
             Ok(num) => num,
-            Err(_) => continue,
+            Err(_) => {
+                if col_input.trim().to_lowercase() == "exit" {
+                    break;
+                }
+                continue;
+            }
         };
 
-        if can_place_in_col(&game.board, col_input) {
-            play_move(&mut game, col_input);
+        if can_place_in_col(&game.board, col - 1) {
+            play_move(&mut game, col - 1);
             print_board(&game.board);
+        } else {
+            println!("Invalid Column");
+            continue;
+        }
+        if check_game_over(&game) {
+            break;
         }
         let comp_move = get_comp_move(&game);
         play_move(&mut game, comp_move);
@@ -93,17 +105,21 @@ fn game_init(depth: usize) -> Game {
 }
 
 fn can_place_in_col(board: &Board, col: usize) -> bool {
-    board.array[0][col - 1] == 0
+    col < COLS && board.array[0][col] == 0
 }
 
 fn play_move(game: &mut Game, col: usize) {
     game.turns_taken += 1;
+    play_move_inner(&mut game.board, col, game.red_turn);
     game.red_turn = !game.red_turn;
-    let mut row_to_check = game.board.array.len() - 1;
-    while game.board.array[row_to_check][col - 1] != 0 {
+}
+
+fn play_move_inner(board: &mut Board, col: usize, red_turn: bool) {
+    let mut row_to_check = board.array.len() - 1;
+    while board.array[row_to_check][col] != 0 {
         row_to_check -= 1;
     }
-    game.board.array[row_to_check][col - 1] = if game.red_turn { 1 } else { 2 };
+    board.array[row_to_check][col] = if red_turn { 1 } else { 2 };
 }
 
 fn print_board(board: &Board) {
@@ -125,6 +141,7 @@ fn print_board(board: &Board) {
         print!("{}", "\n")
     }
     print!("{}", "¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯\n");
+    print!("{}", "  1    2    3    4    5    6    7 \n");
 }
 
 fn score_board(board: &Board, row: usize, col: usize, d_y: isize, d_x: isize) -> isize {
@@ -237,10 +254,6 @@ fn is_draw(board: &Board) -> bool {
     return true;
 }
 
-fn get_board_copy(board: &Board) -> Board {
-    board.clone()
-}
-
 fn get_comp_move(game: &Game) -> usize {
     let result = maximize(&game.board, game.depth, -100000, 100000);
     result.col
@@ -261,8 +274,9 @@ fn maximize(board: &Board, depth: usize, mut alpha: isize, beta: isize) -> AIMov
         score: -99999,
     };
     for col in [4, 3, 5, 2, 6, 1, 0] {
-        let new_board = get_board_copy(board);
-        if can_place_in_col(board, col + 1) {
+        let mut new_board = board.clone();
+        if can_place_in_col(&new_board, col) {
+            play_move_inner(&mut new_board, col, false);
             let next_move = minimize(&new_board, depth - 1, alpha, beta);
             if max.col == NOCOL || next_move.score > max.score {
                 max.col = col;
@@ -282,25 +296,28 @@ fn minimize(board: &Board, depth: usize, alpha: isize, mut beta: isize) -> AIMov
     if is_finished(board, depth, score) {
         return AIMove { col: NOCOL, score };
     }
-    let mut max = AIMove {
+    let mut min = AIMove {
         col: NOCOL,
         score: 99999,
     };
     for col in [4, 3, 5, 2, 6, 1, 0] {
-        let new_board = get_board_copy(board);
-        if can_place_in_col(board, col + 1) {
+        let mut new_board = board.clone();
+
+        if can_place_in_col(&new_board, col) {
+            play_move_inner(&mut new_board, col, true);
+
             let next_move = maximize(&new_board, depth - 1, alpha, beta);
-            if max.col == NOCOL || next_move.score < max.score {
-                max.col = col;
-                max.score = next_move.score;
+            if min.col == NOCOL || next_move.score < min.score {
+                min.col = col;
+                min.score = next_move.score;
                 beta = next_move.score;
             }
             if alpha >= beta {
-                return max;
+                return min;
             }
         }
     }
-    max
+    min
 }
 
 fn is_finished(board: &Board, depth: usize, score: isize) -> bool {
