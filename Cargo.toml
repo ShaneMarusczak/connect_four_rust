@@ -7,3 +7,5 @@ edition = "2021"
 
 [dependencies]
 colored = "2.0.0"
+to_int_and_back = { git = "https://github.com/ShaneMarusczak/to_int_and_back"}
+

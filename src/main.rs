@@ -1,6 +1,7 @@
 use std::io;
 
 use colored::Colorize;
+use to_int_and_back::to;
 
 const ROWS: usize = 6;
 const COLS: usize = 7;
@@ -23,18 +24,28 @@ struct Game {
 
 fn main() {
     intro();
-    println!("Depth?");
+    let mut getting_dif = true;
+    let mut dif = String::new();
+    let mut depth = 0;
 
-    let mut depth = String::new();
+    while getting_dif {
+        dif.clear();
+        println!("Difficuly?");
+        println!("Valid values are easy, medium, hard, vhard");
 
-    io::stdin()
-        .read_line(&mut depth)
-        .expect("Failed to read line");
+        io::stdin()
+            .read_line(&mut dif)
+            .expect("Failed to read line");
 
-    let depth: usize = match depth.trim().parse() {
-        Ok(num) => num,
-        Err(e) => panic!("{}", e),
-    };
+        depth = match dif.trim().to_lowercase().as_str() {
+            "easy" => 4,
+            "medium" => 6,
+            "hard" => 8,
+            "vhard" => 9,
+            _ => continue,
+        };
+        getting_dif = false;
+    }
 
     let mut game = game_init(depth);
     print_board(&game.board);
@@ -49,12 +60,15 @@ fn main() {
 
         let col: usize = match col_input.trim().parse() {
             Ok(num) => num,
-            Err(_) => {
-                if col_input.trim().to_lowercase() == "exit" {
-                    break;
+            Err(_) => match to::int(&col_input.trim()) {
+                Ok(num) => num as usize,
+                Err(e) => {
+                    print_board(&game.board);
+                    println!("{}", e);
+                    col_input.clear();
+                    continue;
                 }
-                continue;
-            }
+            },
         };
 
         if can_place_in_col(&game.board, col - 1) {
@@ -62,6 +76,7 @@ fn main() {
             print_board(&game.board);
         } else {
             println!("Invalid Column");
+            print_board(&game.board);
             continue;
         }
         if check_game_over(&game) {
@@ -89,8 +104,6 @@ fn intro() {
     print!("{}", "O".yellow());
     print!("{}", "O".yellow());
     print!("{}", "O\n\n".yellow());
-
-    println!("Columns are numbered 1-7")
 }
 
 fn game_init(depth: usize) -> Game {
@@ -115,6 +128,7 @@ fn play_move(game: &mut Game, col: usize) {
 }
 
 fn play_move_inner(board: &mut Board, col: usize, red_turn: bool) {
+    //TODO: This function panics sometimes. Figure out why.
     let mut row_to_check = board.array.len() - 1;
     while board.array[row_to_check][col] != 0 {
         row_to_check -= 1;
@@ -255,8 +269,31 @@ fn is_draw(board: &Board) -> bool {
 }
 
 fn get_comp_move(game: &Game) -> usize {
-    let result = maximize(&game.board, game.depth, -100000, 100000);
-    result.col
+    if game.turns_taken == 1 {
+        return 3;
+    }
+    let mut rv = 4;
+    let mut scan_order = [3, 2, 4, 1, 5, 6, 0];
+    for d in 2..game.depth {
+        let best_move_at_depth = maximize(&game.board, d, RED_WIN, YELLOW_WIN, scan_order).col;
+        rv = best_move_at_depth;
+        if best_move_at_depth == 0 {
+            scan_order = [0, 1, 2, 3, 4, 5, 6];
+        } else if best_move_at_depth == 1 {
+            scan_order = [1, 0, 2, 3, 4, 5, 6];
+        } else if best_move_at_depth == 2 {
+            scan_order = [2, 1, 3, 0, 4, 5, 6];
+        } else if best_move_at_depth == 3 {
+            scan_order = [3, 2, 4, 1, 5, 0, 6];
+        } else if best_move_at_depth == 4 {
+            scan_order = [4, 3, 5, 2, 6, 1, 0];
+        } else if best_move_at_depth == 5 {
+            scan_order = [5, 6, 4, 3, 2, 1, 0];
+        } else if best_move_at_depth == 6 {
+            scan_order = [6, 5, 4, 3, 2, 1, 0];
+        }
+    }
+    rv
 }
 
 struct AIMove {
@@ -264,7 +301,13 @@ struct AIMove {
     score: isize,
 }
 
-fn maximize(board: &Board, depth: usize, mut alpha: isize, beta: isize) -> AIMove {
+fn maximize(
+    board: &Board,
+    depth: usize,
+    mut alpha: isize,
+    beta: isize,
+    scan_order: [usize; 7],
+) -> AIMove {
     let score = evaluate_score(board);
     if is_finished(board, depth, score) {
         return AIMove { col: NOCOL, score };
@@ -273,11 +316,11 @@ fn maximize(board: &Board, depth: usize, mut alpha: isize, beta: isize) -> AIMov
         col: NOCOL,
         score: -99999,
     };
-    for col in [4, 3, 5, 2, 6, 1, 0] {
+    for col in scan_order {
         let mut new_board = board.clone();
         if can_place_in_col(&new_board, col) {
             play_move_inner(&mut new_board, col, false);
-            let next_move = minimize(&new_board, depth - 1, alpha, beta);
+            let next_move = minimize(&new_board, depth - 1, alpha, beta, scan_order);
             if max.col == NOCOL || next_move.score > max.score {
                 max.col = col;
                 max.score = next_move.score;
@@ -291,7 +334,13 @@ fn maximize(board: &Board, depth: usize, mut alpha: isize, beta: isize) -> AIMov
     max
 }
 
-fn minimize(board: &Board, depth: usize, alpha: isize, mut beta: isize) -> AIMove {
+fn minimize(
+    board: &Board,
+    depth: usize,
+    alpha: isize,
+    mut beta: isize,
+    scan_order: [usize; 7],
+) -> AIMove {
     let score = evaluate_score(board);
     if is_finished(board, depth, score) {
         return AIMove { col: NOCOL, score };
@@ -300,13 +349,13 @@ fn minimize(board: &Board, depth: usize, alpha: isize, mut beta: isize) -> AIMov
         col: NOCOL,
         score: 99999,
     };
-    for col in [4, 3, 5, 2, 6, 1, 0] {
+    for col in scan_order {
         let mut new_board = board.clone();
 
         if can_place_in_col(&new_board, col) {
             play_move_inner(&mut new_board, col, true);
 
-            let next_move = maximize(&new_board, depth - 1, alpha, beta);
+            let next_move = maximize(&new_board, depth - 1, alpha, beta, scan_order);
             if min.col == NOCOL || next_move.score < min.score {
                 min.col = col;
                 min.score = next_move.score;
