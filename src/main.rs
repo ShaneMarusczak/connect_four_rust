@@ -274,7 +274,7 @@ fn get_comp_move(game: &Game) -> usize {
     }
     let mut rv = 4;
     let mut scan_order = [3, 2, 4, 1, 5, 6, 0];
-    for d in 2..game.depth {
+    for d in 2..=game.depth {
         let best_move_at_depth = maximize(&game.board, d, RED_WIN, YELLOW_WIN, scan_order).col;
         rv = best_move_at_depth;
         if best_move_at_depth == 0 {
