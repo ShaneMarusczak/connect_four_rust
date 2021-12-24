@@ -23,6 +23,7 @@ struct Game {
 }
 
 fn main() {
+    //TODO: Break this into smaller functions and a lib.rs
     intro();
     let mut getting_dif = true;
     let mut dif = String::new();
