@@ -31,7 +31,7 @@ fn main() {
 
     while getting_dif {
         dif.clear();
-        println!("Difficuly?");
+        println!("Difficulty?");
         println!("Valid values are easy, medium, hard, vhard");
 
         io::stdin()
@@ -61,7 +61,7 @@ fn main() {
 
         let col: usize = match col_input.trim().parse() {
             Ok(num) => num,
-            Err(_) => match to::int(&col_input.trim()) {
+            Err(_) => match to::int(col_input.trim()) {
                 Ok(num) => num as usize,
                 Err(e) => {
                     print_board(&game.board);
@@ -98,9 +98,9 @@ fn intro() {
     print!("{}", "O".red());
     print!("{}", "O".red());
     print!("{}", "O".red());
-    print!("{}", "   ");
+    print!("   ");
     print!("Connect Four!");
-    print!("{}", "   ");
+    print!("   ");
     print!("{}", "O".yellow());
     print!("{}", "O".yellow());
     print!("{}", "O".yellow());
@@ -129,20 +129,26 @@ fn play_move(game: &mut Game, col: usize) {
 }
 
 fn play_move_inner(board: &mut Board, col: usize, red_turn: bool) {
+    //red_turn feels like a hack
+
     //TODO: This function panics sometimes. Figure out why.
     let mut row_to_check = board.array.len() - 1;
+
     while board.array[row_to_check][col] != 0 {
+        if row_to_check == 0 {
+            break;
+        }
         row_to_check -= 1;
     }
     board.array[row_to_check][col] = if red_turn { 1 } else { 2 };
 }
 
 fn print_board(board: &Board) {
-    print!("{}", "___________________________________\n");
+    println!("___________________________________");
     for row in board.array {
         for cell in row {
             if cell == 0 {
-                print!("{}", "|   |");
+                print!("|   |");
             } else if cell == 1 {
                 print!("{}", "| ".white());
                 print!("{}", "◯".red());
@@ -153,10 +159,10 @@ fn print_board(board: &Board) {
                 print!("{}", " |".white());
             }
         }
-        print!("{}", "\n")
+        println!();
     }
-    print!("{}", "¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯\n");
-    print!("{}", "  1    2    3    4    5    6    7 \n");
+    println!("¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯¯");
+    println!("  1    2    3    4    5    6    7 ");
 }
 
 fn score_board(board: &Board, row: usize, col: usize, d_y: isize, d_x: isize) -> isize {
@@ -191,7 +197,7 @@ fn evaluate_score(board: &Board) -> isize {
 
     for row in 0..ROWS - 3 {
         for col in 0..COLS {
-            let score = score_board(&board, row, col, 1, 0);
+            let score = score_board(board, row, col, 1, 0);
             if score == RED_WIN {
                 return RED_WIN;
             }
@@ -204,7 +210,7 @@ fn evaluate_score(board: &Board) -> isize {
 
     for row in 0..ROWS {
         for col in 0..COLS - 3 {
-            let score = score_board(&board, row, col, 0, 1);
+            let score = score_board(board, row, col, 0, 1);
             if score == RED_WIN {
                 return RED_WIN;
             }
@@ -217,7 +223,7 @@ fn evaluate_score(board: &Board) -> isize {
 
     for row in 0..ROWS - 3 {
         for col in 0..COLS - 3 {
-            let score = score_board(&board, row, col, 1, 1);
+            let score = score_board(board, row, col, 1, 1);
             if score == RED_WIN {
                 return RED_WIN;
             }
@@ -230,7 +236,7 @@ fn evaluate_score(board: &Board) -> isize {
 
     for row in 3..ROWS {
         for col in 0..COLS - 4 {
-            let score = score_board(&board, row, col, -1, 1);
+            let score = score_board(board, row, col, -1, 1);
             if score == RED_WIN {
                 return RED_WIN;
             }
@@ -266,7 +272,7 @@ fn is_draw(board: &Board) -> bool {
             return false;
         }
     }
-    return true;
+    true
 }
 
 fn get_comp_move(game: &Game) -> usize {
@@ -302,6 +308,8 @@ struct AIMove {
     score: isize,
 }
 
+//TODO: Combine into MinMax and take the min/max as an arg
+
 fn maximize(
     board: &Board,
     depth: usize,
@@ -334,6 +342,8 @@ fn maximize(
     }
     max
 }
+
+//TODO: Combine into MinMax and take the min/max as an arg
 
 fn minimize(
     board: &Board,
