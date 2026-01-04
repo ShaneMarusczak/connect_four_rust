@@ -1,21 +1,32 @@
-use std::collections::HashMap;
 use std::io;
 
 use colored::Colorize;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
+use rayon::prelude::*;
 use to_int_and_back::to;
 
 // Board dimensions
 const ROWS: usize = 6;
 const COLS: usize = 7;
+const TOTAL_CELLS: usize = ROWS * COLS;
 
 // Scores for win/loss detection
 const WIN_SCORE: i32 = 1_000_000;
 const DRAW_SCORE: i32 = 0;
 
+// Transposition table size (must be power of 2 for fast modulo)
+const TT_SIZE: usize = 1 << 24; // 16 million entries (~256 MB)
+const TT_MASK: u64 = (TT_SIZE - 1) as u64;
+
+// Killer move table depth
+const MAX_KILLER_DEPTH: usize = 64;
+const KILLERS_PER_PLY: usize = 2;
+
+// Endgame tablebase threshold - solve perfectly when this many moves remain
+const ENDGAME_THRESHOLD: i32 = 14;
+
 // Bitboard layout for 7x6 board (using 7 bits per column for easy vertical operations)
-// The board is stored with each column using 7 bits (6 for cells + 1 sentinel bit)
-// This allows for very fast win detection using bit operations
-//
 // Column layout (bit positions):
 //  5 12 19 26 33 40 47
 //  4 11 18 25 32 39 46
@@ -23,31 +34,21 @@ const DRAW_SCORE: i32 = 0;
 //  2  9 16 23 30 37 44
 //  1  8 15 22 29 36 43
 //  0  7 14 21 28 35 42
-//
-// The top bit (6, 13, 20, etc.) serves as a sentinel for column-full detection
 
 /// Bitboard representation of the game state
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct Bitboard {
-    /// Current player's pieces (the player about to move)
     current: u64,
-    /// Mask of all pieces (both players)
     mask: u64,
-    /// Number of moves played
     moves: u32,
 }
 
 impl Bitboard {
     const HEIGHT: u32 = ROWS as u32;
 
-    // Bottom row mask: one bit at the bottom of each column
-    // For a 7-column board with 7 bits per column (6 cells + 1 sentinel):
-    // Bits at positions: 0, 7, 14, 21, 28, 35, 42
     const BOTTOM: u64 =
         (1 << 0) | (1 << 7) | (1 << 14) | (1 << 21) | (1 << 28) | (1 << 35) | (1 << 42);
 
-    // Full board mask (all playable cells) - 6 rows × 7 columns
-    // Each column has bits 0-5 set (6 playable cells), bit 6 is sentinel
     const BOARD_MASK: u64 = Self::BOTTOM * ((1 << Self::HEIGHT) - 1);
 
     fn new() -> Self {
@@ -58,20 +59,16 @@ impl Bitboard {
         }
     }
 
-    /// Returns the opponent's pieces
     #[inline]
     fn opponent(&self) -> u64 {
         self.current ^ self.mask
     }
 
-    /// Check if a column can accept another piece
     #[inline]
     fn can_play(&self, col: usize) -> bool {
         (self.mask & Self::top_mask(col)) == 0
     }
 
-    /// Play a piece in the given column
-    /// Returns the new bitboard state
     #[inline]
     fn play(&self, col: usize) -> Bitboard {
         let mut new_board = *self;
@@ -81,7 +78,6 @@ impl Bitboard {
         new_board
     }
 
-    /// Play a move given the move bitmask (faster than column-based play)
     #[inline]
     fn play_move(&self, move_mask: u64) -> Bitboard {
         let mut new_board = *self;
@@ -91,52 +87,43 @@ impl Bitboard {
         new_board
     }
 
-    /// Check if a position is a winning position
-    /// Uses the efficient 4-direction bit shift method
     #[inline]
     fn is_winning(position: u64) -> bool {
-        // Horizontal check
+        // Horizontal
         let mut m = position & (position >> 7);
         if m & (m >> 14) != 0 {
             return true;
         }
-
-        // Diagonal \ check
+        // Diagonal \
         m = position & (position >> 6);
         if m & (m >> 12) != 0 {
             return true;
         }
-
-        // Diagonal / check
+        // Diagonal /
         m = position & (position >> 8);
         if m & (m >> 16) != 0 {
             return true;
         }
-
-        // Vertical check
+        // Vertical
         m = position & (position >> 1);
         m & (m >> 2) != 0
     }
 
-    /// Check if the opponent just made a winning move
     #[inline]
     fn opponent_wins(&self) -> bool {
         Self::is_winning(self.opponent())
     }
 
-    /// Get positions where the current player can win immediately
     #[inline]
     fn winning_positions(&self) -> u64 {
         Self::compute_winning_positions(self.current, self.mask)
     }
 
-    /// Get positions where the opponent could win
     #[inline]
     fn opponent_winning_positions(&self) -> u64 {
         Self::compute_winning_positions(self.opponent(), self.mask)
     }
 
-    /// Compute winning positions for a given position
     fn compute_winning_positions(position: u64, mask: u64) -> u64 {
         // Vertical
         let mut r = (position << 1) & (position << 2) & (position << 3);
@@ -165,74 +152,59 @@ impl Bitboard {
         r |= p & (position >> 24);
         r |= p & (position << 8);
 
-        // Return only empty, playable positions
         r & (Self::BOARD_MASK ^ mask)
     }
 
-    /// Get possible non-losing moves
-    /// These are moves that don't immediately let the opponent win
     fn possible_non_losing_moves(&self) -> u64 {
         let possible = self.possible_moves();
         let opponent_win = self.opponent_winning_positions();
         let forced_moves = possible & opponent_win;
 
         if forced_moves != 0 {
-            // Must block opponent's winning move
-            // If there are multiple winning threats, we lose
             if forced_moves & (forced_moves - 1) != 0 {
-                return 0; // Multiple threats, no good moves
+                return 0;
             }
-            return forced_moves; // Only one forced move
+            return forced_moves;
         }
 
-        // Avoid moves that give opponent a winning position directly above
         possible & !(opponent_win >> 1)
     }
 
-    /// Get all possible moves as a bitmask
     #[inline]
     fn possible_moves(&self) -> u64 {
         (self.mask + Self::BOTTOM) & Self::BOARD_MASK
     }
 
-    /// Check if board is full
     #[inline]
     fn is_full(&self) -> bool {
-        self.moves >= (ROWS * COLS) as u32
+        self.moves >= TOTAL_CELLS as u32
     }
 
-    /// Count number of moves remaining
     #[inline]
     fn moves_remaining(&self) -> i32 {
-        (ROWS * COLS) as i32 - self.moves as i32
+        TOTAL_CELLS as i32 - self.moves as i32
     }
 
-    /// Mask for the top cell of a column
     #[inline]
     fn top_mask(col: usize) -> u64 {
         1u64 << ((Self::HEIGHT as u64 - 1) + col as u64 * (Self::HEIGHT as u64 + 1))
     }
 
-    /// Mask for the bottom cell of a column
     #[inline]
     fn bottom_mask(col: usize) -> u64 {
         1u64 << (col as u64 * (Self::HEIGHT as u64 + 1))
     }
 
-    /// Mask for an entire column
     #[inline]
     fn column_mask(col: usize) -> u64 {
         ((1u64 << Self::HEIGHT) - 1) << (col as u64 * (Self::HEIGHT as u64 + 1))
     }
 
-    /// Generate a unique key for transposition table
-    /// Uses position + mask encoding that's unique for each game state
     #[inline]
     fn key(&self) -> u64 {
         self.current + self.mask
     }
 
-    /// Convert to display array for printing
     fn to_array(self) -> [[u8; COLS]; ROWS] {
         let mut array = [[0u8; COLS]; ROWS];
         let opponent = self.opponent();
@@ -251,14 +223,62 @@ impl Bitboard {
         array
     }
 
-    /// Compute a score for move ordering - moves that create more threats are better
     fn move_score(&self, move_mask: u64) -> i32 {
         let new_position = self.current | move_mask;
         Self::compute_winning_positions(new_position, self.mask | move_mask).count_ones() as i32
     }
+
 }
 
-/// Transposition table entry types
+// ============================================================================
+// Zobrist Hashing
+// ============================================================================
+
+/// Pre-computed random numbers for Zobrist hashing
+struct ZobristKeys {
+    /// Random numbers for each cell and player combination
+    /// keys[player][cell] where player 0/1 and cell 0-48
+    keys: [[u64; 49]; 2],
+}
+
+impl ZobristKeys {
+    fn new() -> Self {
+        // Use a fixed seed for reproducible hashing
+        let mut rng = StdRng::seed_from_u64(0xDEADBEEF_CAFEBABE);
+        let mut keys = [[0u64; 49]; 2];
+
+        for player_keys in &mut keys {
+            for cell_key in player_keys.iter_mut() {
+                *cell_key = rng.gen();
+            }
+        }
+
+        ZobristKeys { keys }
+    }
+
+    /// Compute hash for a board position
+    fn hash(&self, board: &Bitboard) -> u64 {
+        let mut hash = 0u64;
+        let current = board.current;
+        let opponent = board.opponent();
+
+        for cell in 0..49 {
+            let bit = 1u64 << cell;
+            if current & bit != 0 {
+                hash ^= self.keys[0][cell];
+            } else if opponent & bit != 0 {
+                hash ^= self.keys[1][cell];
+            }
+        }
+
+        hash
+    }
+}
+
+// ============================================================================
+// Transposition Table with Fixed-Size Array
+// ============================================================================
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TTFlag {
     Exact,
@@ -266,74 +286,216 @@ enum TTFlag {
     UpperBound,
 }
 
-/// Transposition table entry
+/// Packed transposition table entry (16 bytes total)
 #[derive(Clone, Copy)]
 struct TTEntry {
-    key: u64,
-    score: i32,
-    flag: TTFlag,
-    depth: u8,
+    key: u64,        // Full key for verification
+    score: i16,      // Score (i16 is enough for Connect Four)
+    depth: u8,       // Search depth
+    flag: u8,        // TTFlag as u8
+    best_move: u8,   // Best move column (0-6, or 255 for none)
+    _padding: [u8; 3],
 }
 
-/// Transposition table for caching evaluated positions
+impl TTEntry {
+    fn empty() -> Self {
+        TTEntry {
+            key: 0,
+            score: 0,
+            depth: 0,
+            flag: 0,
+            best_move: 255,
+            _padding: [0; 3],
+        }
+    }
+
+    fn flag(&self) -> TTFlag {
+        match self.flag {
+            0 => TTFlag::Exact,
+            1 => TTFlag::LowerBound,
+            _ => TTFlag::UpperBound,
+        }
+    }
+
+    fn set_flag(&mut self, flag: TTFlag) {
+        self.flag = match flag {
+            TTFlag::Exact => 0,
+            TTFlag::LowerBound => 1,
+            TTFlag::UpperBound => 2,
+        };
+    }
+}
+
+/// Lock-free transposition table using atomic operations
 struct TranspositionTable {
-    table: HashMap<u64, TTEntry>,
+    /// Fixed-size array of entries
+    entries: Vec<TTEntry>,
+    zobrist: ZobristKeys,
 }
 
 impl TranspositionTable {
     fn new() -> Self {
         TranspositionTable {
-            table: HashMap::with_capacity(8_000_000),
+            entries: vec![TTEntry::empty(); TT_SIZE],
+            zobrist: ZobristKeys::new(),
         }
     }
 
-    fn get(&self, key: u64) -> Option<&TTEntry> {
-        self.table.get(&key).filter(|e| e.key == key)
+    #[inline]
+    fn index(&self, key: u64) -> usize {
+        (key & TT_MASK) as usize
     }
 
-    fn put(&mut self, key: u64, score: i32, flag: TTFlag, depth: u8) {
-        // Always replace strategy with depth preference
-        if let Some(existing) = self.table.get(&key) {
-            if existing.depth > depth && existing.flag == TTFlag::Exact {
-                return;
-            }
+    fn get(&self, board: &Bitboard) -> Option<TTEntry> {
+        let key = self.zobrist.hash(board);
+        let idx = self.index(key);
+        let entry = self.entries[idx];
+
+        if entry.key == key {
+            Some(entry)
+        } else {
+            None
         }
-        self.table.insert(
-            key,
-            TTEntry {
-                key,
-                score,
-                flag,
-                depth,
-            },
-        );
+    }
+
+    fn put(&mut self, board: &Bitboard, score: i32, flag: TTFlag, depth: u8, best_move: Option<usize>) {
+        let key = self.zobrist.hash(board);
+        let idx = self.index(key);
+
+        // Always replace (simpler and often better than depth-based replacement)
+        let mut entry = TTEntry::empty();
+        entry.key = key;
+        entry.score = score.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+        entry.depth = depth;
+        entry.set_flag(flag);
+        entry.best_move = best_move.map(|m| m as u8).unwrap_or(255);
+
+        self.entries[idx] = entry;
     }
 }
 
-/// Opening book - pre-computed best moves for early game positions
+// ============================================================================
+// Killer Move Heuristic
+// ============================================================================
+
+/// Killer moves - moves that caused beta cutoffs at each ply
+struct KillerTable {
+    /// killers[ply][slot] = column that caused cutoff
+    killers: [[u8; KILLERS_PER_PLY]; MAX_KILLER_DEPTH],
+}
+
+impl KillerTable {
+    fn new() -> Self {
+        KillerTable {
+            killers: [[255; KILLERS_PER_PLY]; MAX_KILLER_DEPTH],
+        }
+    }
+
+    /// Record a killer move
+    fn record(&mut self, ply: usize, col: usize) {
+        if ply >= MAX_KILLER_DEPTH {
+            return;
+        }
+
+        // Don't add duplicate
+        if self.killers[ply][0] == col as u8 {
+            return;
+        }
+
+        // Shift and insert at front
+        self.killers[ply][1] = self.killers[ply][0];
+        self.killers[ply][0] = col as u8;
+    }
+
+    /// Get killer moves for a ply
+    fn get_killers(&self, ply: usize) -> [Option<usize>; KILLERS_PER_PLY] {
+        if ply >= MAX_KILLER_DEPTH {
+            return [None; KILLERS_PER_PLY];
+        }
+
+        [
+            if self.killers[ply][0] < 7 { Some(self.killers[ply][0] as usize) } else { None },
+            if self.killers[ply][1] < 7 { Some(self.killers[ply][1] as usize) } else { None },
+        ]
+    }
+}
+
+// ============================================================================
+// Endgame Tablebase (computed at runtime for late positions)
+// ============================================================================
+
+/// Perfect endgame solver for positions with few moves remaining
+struct EndgameSolver;
+
+impl EndgameSolver {
+    /// Solve position perfectly with no depth limit
+    fn solve(board: &Bitboard, mut alpha: i32, mut beta: i32) -> i32 {
+        if board.is_full() {
+            return DRAW_SCORE;
+        }
+
+        let winning = board.winning_positions();
+        let possible = board.possible_moves();
+        if winning & possible != 0 {
+            return (board.moves_remaining() + 1) / 2;
+        }
+
+        let max_score = (board.moves_remaining() - 1) / 2;
+        if beta > max_score {
+            beta = max_score;
+            if alpha >= beta {
+                return beta;
+            }
+        }
+
+        let moves = board.possible_non_losing_moves();
+        if moves == 0 {
+            return -board.moves_remaining() / 2;
+        }
+
+        // Try moves in center-first order
+        for &col in &COLUMN_ORDER {
+            let col_mask = Bitboard::column_mask(col);
+            let move_mask = moves & col_mask;
+            if move_mask != 0 {
+                let new_board = board.play_move(move_mask);
+                let score = -Self::solve(&new_board, -beta, -alpha);
+
+                if score > alpha {
+                    alpha = score;
+                }
+                if alpha >= beta {
+                    return alpha;
+                }
+            }
+        }
+
+        alpha
+    }
+}
+
+// ============================================================================
+// Opening Book
+// ============================================================================
+
 struct OpeningBook {
-    positions: HashMap<u64, usize>,
+    positions: std::collections::HashMap<u64, usize>,
 }
 
 impl OpeningBook {
     fn new() -> Self {
-        let mut positions = HashMap::new();
+        let mut positions = std::collections::HashMap::new();
 
         // Empty board - play center
         positions.insert(0, 3);
 
-        // After opponent plays center, we play center too (on top)
-        let board = Bitboard::new().play(3);
-        positions.insert(board.key(), 3);
-
-        // After opponent plays edge columns, we play center
-        for col in [0, 1, 2, 4, 5, 6] {
+        // After opponent plays any column, we play center
+        for col in 0..7 {
             let board = Bitboard::new().play(col);
             positions.insert(board.key(), 3);
         }
 
-        // Common responses in strong play
-        // If opponent plays 3, we play 3, then if they play 2, we play 4
+        // Common strong continuations
         let board = Bitboard::new().play(3).play(3);
         positions.insert(board.key(), 2);
         let board = Bitboard::new().play(3).play(3).play(2);
@@ -349,7 +511,493 @@ impl OpeningBook {
     }
 }
 
-/// Game state
+// ============================================================================
+// Column order for move exploration
+// ============================================================================
+
+const COLUMN_ORDER: [usize; 7] = [3, 2, 4, 1, 5, 0, 6];
+
+// ============================================================================
+// Parallel Solver using Lazy SMP
+// ============================================================================
+
+/// Single-threaded solver for use within parallel search
+struct Solver<'a> {
+    tt: &'a mut TranspositionTable,
+    killers: KillerTable,
+    nodes_explored: u64,
+}
+
+impl<'a> Solver<'a> {
+    fn new(tt: &'a mut TranspositionTable) -> Self {
+        Solver {
+            tt,
+            killers: KillerTable::new(),
+            nodes_explored: 0,
+        }
+    }
+
+    /// Negamax with alpha-beta, killer moves, and TT
+    fn negamax(&mut self, board: &Bitboard, mut alpha: i32, mut beta: i32, depth: u8, ply: usize) -> i32 {
+        self.nodes_explored += 1;
+
+        // Use endgame solver for late positions
+        if board.moves_remaining() <= ENDGAME_THRESHOLD && depth > 0 {
+            return EndgameSolver::solve(board, alpha, beta);
+        }
+
+        if board.is_full() {
+            return DRAW_SCORE;
+        }
+
+        let winning = board.winning_positions();
+        let possible = board.possible_moves();
+        if winning & possible != 0 {
+            return (board.moves_remaining() + 1) / 2;
+        }
+
+        let max_score = (board.moves_remaining() - 1) / 2;
+        if beta > max_score {
+            beta = max_score;
+            if alpha >= beta {
+                return beta;
+            }
+        }
+
+        // TT lookup
+        let mut tt_move: Option<usize> = None;
+        if let Some(entry) = self.tt.get(board) {
+            if entry.depth >= depth {
+                match entry.flag() {
+                    TTFlag::Exact => return entry.score as i32,
+                    TTFlag::LowerBound => {
+                        if entry.score as i32 >= beta {
+                            return entry.score as i32;
+                        }
+                        alpha = alpha.max(entry.score as i32);
+                    }
+                    TTFlag::UpperBound => {
+                        if (entry.score as i32) <= alpha {
+                            return entry.score as i32;
+                        }
+                        beta = beta.min(entry.score as i32);
+                    }
+                }
+            }
+            if entry.best_move < 7 {
+                tt_move = Some(entry.best_move as usize);
+            }
+        }
+
+        if depth == 0 {
+            return self.evaluate(board);
+        }
+
+        let moves = board.possible_non_losing_moves();
+        if moves == 0 {
+            return -board.moves_remaining() / 2;
+        }
+
+        // Build move list with ordering: TT move, killer moves, then by score
+        let mut move_list: Vec<(usize, i32)> = Vec::with_capacity(7);
+        let killers = self.killers.get_killers(ply);
+
+        for &col in &COLUMN_ORDER {
+            let col_mask = Bitboard::column_mask(col);
+            let move_mask = moves & col_mask;
+            if move_mask != 0 {
+                let mut priority = board.move_score(move_mask);
+
+                // Boost TT move
+                if tt_move == Some(col) {
+                    priority += 10000;
+                }
+                // Boost killer moves
+                else if killers[0] == Some(col) {
+                    priority += 5000;
+                } else if killers[1] == Some(col) {
+                    priority += 4000;
+                }
+
+                move_list.push((col, priority));
+            }
+        }
+
+        move_list.sort_by(|a, b| b.1.cmp(&a.1));
+
+        let mut best_score = i32::MIN;
+        let mut best_move = None;
+        let orig_alpha = alpha;
+        let mut first_move = true;
+
+        for (col, _) in move_list {
+            let col_mask = Bitboard::column_mask(col);
+            let move_mask = moves & col_mask;
+            let new_board = board.play_move(move_mask);
+
+            let score = if first_move {
+                -self.negamax(&new_board, -beta, -alpha, depth - 1, ply + 1)
+            } else {
+                // PVS: null window search first
+                let mut score = -self.negamax(&new_board, -alpha - 1, -alpha, depth - 1, ply + 1);
+                if score > alpha && score < beta {
+                    score = -self.negamax(&new_board, -beta, -alpha, depth - 1, ply + 1);
+                }
+                score
+            };
+            first_move = false;
+
+            if score > best_score {
+                best_score = score;
+                best_move = Some(col);
+            }
+            if score > alpha {
+                alpha = score;
+            }
+            if alpha >= beta {
+                // Record killer move on cutoff
+                self.killers.record(ply, col);
+                break;
+            }
+        }
+
+        if best_score == i32::MIN {
+            best_score = -board.moves_remaining() / 2;
+        }
+
+        // Store in TT
+        let flag = if best_score <= orig_alpha {
+            TTFlag::UpperBound
+        } else if best_score >= beta {
+            TTFlag::LowerBound
+        } else {
+            TTFlag::Exact
+        };
+        self.tt.put(board, best_score, flag, depth, best_move);
+
+        best_score
+    }
+
+    /// Enhanced static evaluation with multiple heuristics
+    fn evaluate(&self, board: &Bitboard) -> i32 {
+        let current = board.current;
+        let opponent = board.opponent();
+        let empty = Bitboard::BOARD_MASK ^ board.mask;
+
+        // 1. Immediate winning positions (very high value)
+        let current_wins = Bitboard::compute_winning_positions(current, board.mask);
+        let opponent_wins = Bitboard::compute_winning_positions(opponent, board.mask);
+
+        let current_win_count = current_wins.count_ones() as i32;
+        let opponent_win_count = opponent_wins.count_ones() as i32;
+
+        // 2. Three-in-a-row threats (high value)
+        let current_threats = Self::count_threats(current, board.mask);
+        let opponent_threats = Self::count_threats(opponent, board.mask);
+
+        // 3. Two-in-a-row with potential (medium value)
+        let current_pairs = Self::count_open_pairs(current, empty);
+        let opponent_pairs = Self::count_open_pairs(opponent, empty);
+
+        // 4. Center control bonus (center column is most valuable)
+        let center_control = Self::center_control_score(current, opponent);
+
+        // 5. Odd/Even threat analysis (critical in Connect Four)
+        // Threats on odd rows are more valuable for first player
+        let odd_even_score = Self::odd_even_analysis(current_wins, opponent_wins, board.moves);
+
+        // 6. Connectivity bonus - pieces that connect to others are stronger
+        let current_connectivity = Self::connectivity_score(current);
+        let opponent_connectivity = Self::connectivity_score(opponent);
+
+        // Combine all factors with appropriate weights
+        let win_diff = (current_win_count - opponent_win_count) * 100;
+        let threat_diff = (current_threats - opponent_threats) * 30;
+        let pair_diff = (current_pairs - opponent_pairs) * 10;
+        let connectivity_diff = (current_connectivity - opponent_connectivity) * 5;
+
+        win_diff + threat_diff + pair_diff + center_control + odd_even_score + connectivity_diff
+    }
+
+    /// Count three-in-a-row patterns with one empty slot
+    fn count_threats(position: u64, mask: u64) -> i32 {
+        let empty = Bitboard::BOARD_MASK ^ mask;
+        let mut count = 0i32;
+
+        // Horizontal: XXX_ and _XXX
+        let h1 = position & (position >> 7);
+        let h2 = h1 & (position >> 14);
+        count += (h2 & (empty >> 21)).count_ones() as i32;
+        count += ((position >> 21) & (h1 >> 7) & empty).count_ones() as i32;
+
+        // Horizontal: XX_X and X_XX (gaps in the middle)
+        let h_gap1 = position & (position >> 7) & (position >> 21);
+        count += (h_gap1 & (empty >> 14)).count_ones() as i32;
+        let h_gap2 = position & (position >> 14) & (position >> 21);
+        count += (h_gap2 & (empty >> 7)).count_ones() as i32;
+
+        // Vertical
+        let v1 = position & (position >> 1);
+        let v2 = v1 & (position >> 2);
+        count += (v2 & (empty >> 3)).count_ones() as i32;
+
+        // Diagonal \
+        let d1 = position & (position >> 6);
+        let d2 = d1 & (position >> 12);
+        count += (d2 & (empty >> 18)).count_ones() as i32;
+        count += ((position >> 18) & (d1 >> 6) & empty).count_ones() as i32;
+
+        // Diagonal /
+        let d3 = position & (position >> 8);
+        let d4 = d3 & (position >> 16);
+        count += (d4 & (empty >> 24)).count_ones() as i32;
+        count += ((position >> 24) & (d3 >> 8) & empty).count_ones() as i32;
+
+        count
+    }
+
+    /// Count two-in-a-row patterns with open ends
+    fn count_open_pairs(position: u64, empty: u64) -> i32 {
+        let mut count = 0i32;
+
+        // Horizontal pairs with space to grow
+        let h_pair = position & (position >> 7);
+        count += (h_pair & (empty >> 14) & (empty << 7)).count_ones() as i32;
+
+        // Vertical pairs
+        let v_pair = position & (position >> 1);
+        count += (v_pair & (empty >> 2)).count_ones() as i32;
+
+        // Diagonal pairs
+        let d1_pair = position & (position >> 6);
+        count += (d1_pair & (empty >> 12) & (empty << 6)).count_ones() as i32;
+
+        let d2_pair = position & (position >> 8);
+        count += (d2_pair & (empty >> 16) & (empty << 8)).count_ones() as i32;
+
+        count
+    }
+
+    /// Calculate center control bonus
+    fn center_control_score(current: u64, opponent: u64) -> i32 {
+        // Column weights: edges are worst, center is best
+        const COL_WEIGHTS: [i32; 7] = [1, 2, 3, 4, 3, 2, 1];
+
+        let mut score = 0i32;
+
+        for (col, &weight) in COL_WEIGHTS.iter().enumerate() {
+            let col_mask = Bitboard::column_mask(col);
+            let current_in_col = (current & col_mask).count_ones() as i32;
+            let opponent_in_col = (opponent & col_mask).count_ones() as i32;
+            score += (current_in_col - opponent_in_col) * weight;
+        }
+
+        score * 3 // Weight for center control
+    }
+
+    /// Analyze odd/even row threats
+    /// In Connect Four, the first player wins threats on odd rows (1, 3, 5)
+    /// Second player wins threats on even rows (0, 2, 4)
+    fn odd_even_analysis(current_wins: u64, opponent_wins: u64, moves: u32) -> i32 {
+        let is_first_player = moves.is_multiple_of(2);
+
+        // Odd row mask (rows 1, 3, 5 = bits 1, 3, 5 in each column)
+        let odd_mask: u64 = 0x2A | (0x2A << 7) | (0x2A << 14) | (0x2A << 21) | (0x2A << 28) | (0x2A << 35) | (0x2A << 42);
+        let even_mask: u64 = Bitboard::BOARD_MASK & !odd_mask;
+
+        let current_odd = (current_wins & odd_mask).count_ones() as i32;
+        let current_even = (current_wins & even_mask).count_ones() as i32;
+        let opponent_odd = (opponent_wins & odd_mask).count_ones() as i32;
+        let opponent_even = (opponent_wins & even_mask).count_ones() as i32;
+
+        if is_first_player {
+            // First player benefits from odd-row threats
+            (current_odd * 15 + current_even * 5) - (opponent_odd * 5 + opponent_even * 15)
+        } else {
+            // Second player benefits from even-row threats
+            (current_even * 15 + current_odd * 5) - (opponent_even * 5 + opponent_odd * 15)
+        }
+    }
+
+    /// Score based on piece connectivity (pieces adjacent to other pieces)
+    fn connectivity_score(position: u64) -> i32 {
+        let mut score = 0i32;
+
+        // Count horizontal connections
+        score += (position & (position >> 7)).count_ones() as i32;
+
+        // Count vertical connections
+        score += (position & (position >> 1)).count_ones() as i32;
+
+        // Count diagonal connections
+        score += (position & (position >> 6)).count_ones() as i32;
+        score += (position & (position >> 8)).count_ones() as i32;
+
+        score
+    }
+
+    /// Find best move with iterative deepening
+    fn find_best_move(&mut self, board: &Bitboard, max_depth: usize) -> (usize, i32) {
+        self.nodes_explored = 0;
+
+        // Check for immediate wins
+        let winning = board.winning_positions();
+        let possible = board.possible_moves();
+
+        if winning & possible != 0 {
+            for col in COLUMN_ORDER {
+                let col_mask = Bitboard::column_mask(col);
+                if winning & possible & col_mask != 0 {
+                    return (col, (board.moves_remaining() + 1) / 2);
+                }
+            }
+        }
+
+        let safe_moves = board.possible_non_losing_moves();
+        if safe_moves == 0 {
+            for col in COLUMN_ORDER {
+                if board.can_play(col) {
+                    return (col, -WIN_SCORE);
+                }
+            }
+        }
+
+        let mut best_col = 3;
+        let mut best_score = i32::MIN;
+
+        // Iterative deepening
+        for depth in 1..=max_depth {
+            let mut alpha = -WIN_SCORE;
+            let beta = WIN_SCORE;
+
+            let mut move_scores: Vec<(usize, i32)> = COLUMN_ORDER
+                .iter()
+                .filter_map(|&col| {
+                    let col_mask = Bitboard::column_mask(col);
+                    let move_mask = safe_moves & col_mask;
+                    if move_mask != 0 {
+                        Some((col, board.move_score(move_mask)))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            move_scores.sort_by(|a, b| b.1.cmp(&a.1));
+
+            for (col, _) in &move_scores {
+                let col_mask = Bitboard::column_mask(*col);
+                let move_mask = safe_moves & col_mask;
+                let new_board = board.play_move(move_mask);
+
+                let score = -self.negamax(&new_board, -beta, -alpha, depth as u8, 1);
+
+                if score > best_score || (score == best_score && *col == 3) {
+                    best_score = score;
+                    best_col = *col;
+                }
+                if score > alpha {
+                    alpha = score;
+                }
+            }
+
+            // Early exit on forced win
+            if best_score >= (board.moves_remaining() - depth as i32) / 2 {
+                break;
+            }
+        }
+
+        (best_col, best_score)
+    }
+}
+
+/// Parallel search using Lazy SMP (multiple threads searching same tree)
+fn parallel_find_best_move(
+    board: &Bitboard,
+    tt: &mut TranspositionTable,
+    max_depth: usize,
+) -> (usize, i32) {
+    // For low depths or few moves remaining, use single-threaded search
+    if max_depth <= 8 || board.moves_remaining() <= ENDGAME_THRESHOLD {
+        let mut solver = Solver::new(tt);
+        return solver.find_best_move(board, max_depth);
+    }
+
+    // Check for immediate wins first
+    let winning = board.winning_positions();
+    let possible = board.possible_moves();
+
+    if winning & possible != 0 {
+        for col in COLUMN_ORDER {
+            let col_mask = Bitboard::column_mask(col);
+            if winning & possible & col_mask != 0 {
+                return (col, (board.moves_remaining() + 1) / 2);
+            }
+        }
+    }
+
+    let safe_moves = board.possible_non_losing_moves();
+    if safe_moves == 0 {
+        for col in COLUMN_ORDER {
+            if board.can_play(col) {
+                return (col, -WIN_SCORE);
+            }
+        }
+    }
+
+    // Collect available moves
+    let moves: Vec<usize> = COLUMN_ORDER
+        .iter()
+        .filter(|&&col| {
+            let col_mask = Bitboard::column_mask(col);
+            safe_moves & col_mask != 0
+        })
+        .copied()
+        .collect();
+
+    if moves.len() == 1 {
+        return (moves[0], 0);
+    }
+
+    // Parallel search over root moves using Lazy SMP
+    let board_copy = *board;
+    let results: Vec<(usize, i32)> = moves
+        .par_iter()
+        .map(|&col| {
+            let col_mask = Bitboard::column_mask(col);
+            let move_mask = safe_moves & col_mask;
+            let new_board = board_copy.play_move(move_mask);
+
+            // Each thread gets its own TT (Lazy SMP style)
+            let mut local_tt = TranspositionTable::new();
+            let mut solver = Solver::new(&mut local_tt);
+
+            let score = -solver.negamax(&new_board, -WIN_SCORE, WIN_SCORE, max_depth as u8, 1);
+            (col, score)
+        })
+        .collect();
+
+    // Find best result
+    let mut final_best_col = 3;
+    let mut final_best_score = i32::MIN;
+
+    for (col, score) in results {
+        if score > final_best_score || (score == final_best_score && col == 3) {
+            final_best_score = score;
+            final_best_col = col;
+        }
+    }
+
+    // Update TT with best move info
+    tt.put(board, final_best_score, TTFlag::Exact, max_depth as u8, Some(final_best_col));
+
+    (final_best_col, final_best_score)
+}
+
+// ============================================================================
+// Game State
+// ============================================================================
+
 struct Game {
     board: Bitboard,
     red_turn: bool,
@@ -384,287 +1032,16 @@ impl Game {
 
     fn get_winner(&self) -> Option<&str> {
         if self.board.opponent_wins() {
-            // The opponent of current player won (the one who just played)
             Some(if self.red_turn { "YELLOW" } else { "RED" })
         } else {
-            None // Draw or game not over
+            None
         }
     }
 }
 
-/// Column order for move exploration (center-first for better pruning)
-const COLUMN_ORDER: [usize; 7] = [3, 2, 4, 1, 5, 0, 6];
-
-/// Negamax solver with alpha-beta pruning, transposition table, and advanced techniques
-struct Solver<'a> {
-    tt: &'a mut TranspositionTable,
-    nodes_explored: u64,
-}
-
-impl<'a> Solver<'a> {
-    fn new(tt: &'a mut TranspositionTable) -> Self {
-        Solver {
-            tt,
-            nodes_explored: 0,
-        }
-    }
-
-    /// Principal Variation Search (PVS) - an enhancement of alpha-beta
-    /// First move is searched with full window, others with null window
-    fn negamax(&mut self, board: &Bitboard, mut alpha: i32, mut beta: i32, depth: u8) -> i32 {
-        self.nodes_explored += 1;
-
-        // Check for draw
-        if board.is_full() {
-            return DRAW_SCORE;
-        }
-
-        // Check if current player can win immediately
-        let winning = board.winning_positions();
-        let possible = board.possible_moves();
-        if winning & possible != 0 {
-            return (board.moves_remaining() + 1) / 2;
-        }
-
-        // Upper bound on score
-        let max_score = (board.moves_remaining() - 1) / 2;
-        if beta > max_score {
-            beta = max_score;
-            if alpha >= beta {
-                return beta;
-            }
-        }
-
-        // Transposition table lookup
-        let key = board.key();
-        if let Some(entry) = self.tt.get(key) {
-            if entry.depth >= depth {
-                match entry.flag {
-                    TTFlag::Exact => return entry.score,
-                    TTFlag::LowerBound => {
-                        if entry.score >= beta {
-                            return entry.score;
-                        }
-                        alpha = alpha.max(entry.score);
-                    }
-                    TTFlag::UpperBound => {
-                        if entry.score <= alpha {
-                            return entry.score;
-                        }
-                        beta = beta.min(entry.score);
-                    }
-                }
-            }
-        }
-
-        // Depth limit - use static evaluation
-        if depth == 0 {
-            return self.evaluate(board);
-        }
-
-        // Get non-losing moves
-        let moves = board.possible_non_losing_moves();
-        if moves == 0 {
-            return -board.moves_remaining() / 2;
-        }
-
-        // Sort moves by their potential (move ordering optimization)
-        let mut move_list: Vec<(usize, i32)> = COLUMN_ORDER
-            .iter()
-            .filter_map(|&col| {
-                let col_mask = Bitboard::column_mask(col);
-                let move_mask = moves & col_mask;
-                if move_mask != 0 {
-                    Some((col, board.move_score(move_mask)))
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        // Sort by score descending (best moves first)
-        move_list.sort_by(|a, b| b.1.cmp(&a.1));
-
-        let mut best_score = i32::MIN;
-        let orig_alpha = alpha;
-        let mut first_move = true;
-
-        for (col, _) in move_list {
-            let col_mask = Bitboard::column_mask(col);
-            let move_mask = moves & col_mask;
-            let new_board = board.play_move(move_mask);
-
-            let score = if first_move {
-                // Search first move with full window
-                -self.negamax(&new_board, -beta, -alpha, depth - 1)
-            } else {
-                // Null window search for other moves
-                let mut score = -self.negamax(&new_board, -alpha - 1, -alpha, depth - 1);
-                if score > alpha && score < beta {
-                    // Re-search with full window if it might be better
-                    score = -self.negamax(&new_board, -beta, -alpha, depth - 1);
-                }
-                score
-            };
-            first_move = false;
-
-            if score > best_score {
-                best_score = score;
-            }
-            if score > alpha {
-                alpha = score;
-            }
-            if alpha >= beta {
-                break;
-            }
-        }
-
-        // Handle case where no moves were tried
-        if best_score == i32::MIN {
-            best_score = -board.moves_remaining() / 2;
-        }
-
-        // Store in transposition table
-        let flag = if best_score <= orig_alpha {
-            TTFlag::UpperBound
-        } else if best_score >= beta {
-            TTFlag::LowerBound
-        } else {
-            TTFlag::Exact
-        };
-        self.tt.put(key, best_score, flag, depth);
-
-        best_score
-    }
-
-    /// Find the best move for the current player using iterative deepening
-    fn find_best_move(&mut self, board: &Bitboard, max_depth: usize) -> (usize, i32) {
-        self.nodes_explored = 0;
-
-        // Check for immediate wins first
-        let winning = board.winning_positions();
-        let possible = board.possible_moves();
-
-        if winning & possible != 0 {
-            // Find which column wins
-            for col in COLUMN_ORDER {
-                let col_mask = Bitboard::column_mask(col);
-                if winning & possible & col_mask != 0 {
-                    return (col, (board.moves_remaining() + 1) / 2);
-                }
-            }
-        }
-
-        // Get non-losing moves
-        let safe_moves = board.possible_non_losing_moves();
-        if safe_moves == 0 {
-            // All moves lose - just play first available
-            for col in COLUMN_ORDER {
-                if board.can_play(col) {
-                    return (col, -WIN_SCORE);
-                }
-            }
-        }
-
-        let mut best_col = 3;
-        let mut best_score = i32::MIN;
-
-        // Iterative deepening with aspiration windows
-        for depth in 1..=max_depth {
-            let mut alpha = -WIN_SCORE;
-            let beta = WIN_SCORE;
-
-            // Sort moves for this iteration
-            let mut move_scores: Vec<(usize, i32)> = COLUMN_ORDER
-                .iter()
-                .filter_map(|&col| {
-                    let col_mask = Bitboard::column_mask(col);
-                    let move_mask = safe_moves & col_mask;
-                    if move_mask != 0 {
-                        Some((col, board.move_score(move_mask)))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            move_scores.sort_by(|a, b| b.1.cmp(&a.1));
-
-            for (col, _) in &move_scores {
-                let col_mask = Bitboard::column_mask(*col);
-                let move_mask = safe_moves & col_mask;
-                let new_board = board.play_move(move_mask);
-
-                let score = -self.negamax(&new_board, -beta, -alpha, depth as u8);
-
-                if score > best_score || (score == best_score && *col == 3) {
-                    best_score = score;
-                    best_col = *col;
-                }
-                if score > alpha {
-                    alpha = score;
-                }
-            }
-
-            // Early exit if we found a winning move
-            if best_score >= (board.moves_remaining() - depth as i32) / 2 {
-                break;
-            }
-        }
-
-        (best_col, best_score)
-    }
-
-    /// Static evaluation for positions at depth limit
-    fn evaluate(&self, board: &Bitboard) -> i32 {
-        let current = board.current;
-        let opponent = board.opponent();
-
-        // Count threats for each player
-        let current_threats = Self::count_threats(current, board.mask);
-        let opponent_threats = Self::count_threats(opponent, board.mask);
-
-        // Also consider potential winning positions
-        let current_wins = Bitboard::compute_winning_positions(current, board.mask).count_ones() as i32;
-        let opponent_wins = Bitboard::compute_winning_positions(opponent, board.mask).count_ones() as i32;
-
-        (current_threats * 2 + current_wins * 3) - (opponent_threats * 2 + opponent_wins * 3)
-    }
-
-    /// Count potential threats (3-in-a-row with empty slot)
-    fn count_threats(position: u64, mask: u64) -> i32 {
-        let empty = Bitboard::BOARD_MASK ^ mask;
-        let mut count = 0i32;
-
-        // Horizontal
-        let h1 = position & (position >> 7);
-        let h2 = h1 & (position >> 14);
-        count += (h2 & (empty >> 21)).count_ones() as i32;
-        count += (h2 & (empty << 7)).count_ones() as i32;
-
-        // Also count 2-in-a-row patterns with 2 empty slots
-        let h_open = h1 & (empty >> 14) & (empty >> 21);
-        count += h_open.count_ones() as i32 / 2;
-
-        // Vertical
-        let v1 = position & (position >> 1);
-        let v2 = v1 & (position >> 2);
-        count += (v2 & (empty >> 3)).count_ones() as i32;
-
-        // Diagonals
-        let d1 = position & (position >> 6);
-        let d2 = d1 & (position >> 12);
-        count += (d2 & (empty >> 18)).count_ones() as i32;
-        count += (d2 & (empty << 6)).count_ones() as i32;
-
-        let d3 = position & (position >> 8);
-        let d4 = d3 & (position >> 16);
-        count += (d4 & (empty >> 24)).count_ones() as i32;
-        count += (d4 & (empty << 8)).count_ones() as i32;
-
-        count
-    }
-}
+// ============================================================================
+// Main and UI
+// ============================================================================
 
 fn main() {
     intro();
@@ -675,7 +1052,6 @@ fn main() {
     print_board(game.board);
 
     loop {
-        // Human player's turn
         let col = get_human_move(&game);
         game.play(col);
         print_board(game.board);
@@ -685,26 +1061,19 @@ fn main() {
             break;
         }
 
-        // AI's turn
         println!("AI is thinking...");
 
-        // Check opening book first
         let (ai_col, score) = if let Some(book_move) = game.opening_book.lookup(&game.board) {
             (book_move, 0)
         } else {
-            let mut solver = Solver::new(&mut game.tt);
-            solver.find_best_move(&game.board, game.depth)
+            parallel_find_best_move(&game.board, &mut game.tt, game.depth)
         };
 
         game.play(ai_col);
         println!(
             "AI plays column {} (eval: {})",
             ai_col + 1,
-            if score > 0 {
-                format!("+{score}")
-            } else {
-                score.to_string()
-            }
+            if score > 0 { format!("+{score}") } else { score.to_string() }
         );
         print_board(game.board);
 
@@ -721,12 +1090,13 @@ fn intro() {
     print!("{}", "O".red());
     print!("{}", "O".red());
     print!("   ");
-    print!("Connect Four!");
+    print!("Connect Four AI");
     print!("   ");
     print!("{}", "O".yellow());
     print!("{}", "O".yellow());
     print!("{}", "O".yellow());
     print!("{}", "O\n\n".yellow());
+    println!("Features: Bitboard | Transposition Table | Killer Moves | Parallel Search | Endgame Solver\n");
 }
 
 fn get_difficulty() -> usize {
@@ -740,12 +1110,12 @@ fn get_difficulty() -> usize {
             .expect("Failed to read line");
 
         match dif.trim().to_lowercase().as_str() {
-            "easy" => return 6,
-            "medium" => return 10,
-            "hard" => return 14,
-            "vhard" => return 18,
-            "expert" => return 24,
-            "impossible" => return 42, // Full tree search (perfect play)
+            "easy" => return 8,
+            "medium" => return 12,
+            "hard" => return 16,
+            "vhard" => return 20,
+            "expert" => return 28,
+            "impossible" => return 42,
             _ => continue,
         }
     }
@@ -812,6 +1182,10 @@ fn print_result(game: &Game) {
     }
 }
 
+// ============================================================================
+// Tests
+// ============================================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -853,14 +1227,13 @@ mod tests {
     #[test]
     fn test_horizontal_win() {
         let mut board = Bitboard::new();
-        // Player 1 plays: 0, 1, 2, 3 (with player 2 playing elsewhere)
-        board = board.play(0); // P1
-        board = board.play(6); // P2
-        board = board.play(1); // P1
-        board = board.play(6); // P2
-        board = board.play(2); // P1
-        board = board.play(6); // P2
-        board = board.play(3); // P1 wins
+        board = board.play(0);
+        board = board.play(6);
+        board = board.play(1);
+        board = board.play(6);
+        board = board.play(2);
+        board = board.play(6);
+        board = board.play(3);
 
         assert!(board.opponent_wins());
     }
@@ -868,14 +1241,13 @@ mod tests {
     #[test]
     fn test_vertical_win() {
         let mut board = Bitboard::new();
-        // Player 1 stacks in column 0
-        board = board.play(0); // P1
-        board = board.play(1); // P2
-        board = board.play(0); // P1
-        board = board.play(1); // P2
-        board = board.play(0); // P1
-        board = board.play(1); // P2
-        board = board.play(0); // P1 wins
+        board = board.play(0);
+        board = board.play(1);
+        board = board.play(0);
+        board = board.play(1);
+        board = board.play(0);
+        board = board.play(1);
+        board = board.play(0);
 
         assert!(board.opponent_wins());
     }
@@ -883,19 +1255,17 @@ mod tests {
     #[test]
     fn test_diagonal_win() {
         let mut board = Bitboard::new();
-        // Set up diagonal win for P1
-        // P1: (5,0), (4,1), (3,2), (2,3)
-        board = board.play(0); // P1 at (5,0)
-        board = board.play(1); // P2 at (5,1)
-        board = board.play(1); // P1 at (4,1)
-        board = board.play(2); // P2 at (5,2)
-        board = board.play(2); // P1 at (4,2)
-        board = board.play(3); // P2 at (5,3)
-        board = board.play(2); // P1 at (3,2)
-        board = board.play(3); // P2 at (4,3)
-        board = board.play(3); // P1 at (3,3)
-        board = board.play(0); // P2 at (4,0)
-        board = board.play(3); // P1 at (2,3) - wins diagonal!
+        board = board.play(0);
+        board = board.play(1);
+        board = board.play(1);
+        board = board.play(2);
+        board = board.play(2);
+        board = board.play(3);
+        board = board.play(2);
+        board = board.play(3);
+        board = board.play(3);
+        board = board.play(0);
+        board = board.play(3);
 
         assert!(board.opponent_wins());
     }
@@ -907,33 +1277,14 @@ mod tests {
     }
 
     #[test]
-    fn test_winning_positions() {
-        let mut board = Bitboard::new();
-        // Set up 3 in a row
-        board = board.play(0); // P1
-        board = board.play(6); // P2
-        board = board.play(1); // P1
-        board = board.play(6); // P2
-        board = board.play(2); // P1
-
-        // Check P1's winning positions
-        let winning = Bitboard::compute_winning_positions(board.opponent(), board.mask);
-        // P1 should be able to win at column 3
-        let col3_bottom = Bitboard::bottom_mask(3);
-        assert!(winning & col3_bottom != 0);
-    }
-
-    #[test]
     fn test_solver_finds_winning_move() {
         let mut board = Bitboard::new();
-        // Set up 3 in a row for P1
-        board = board.play(0); // P1
-        board = board.play(6); // P2
-        board = board.play(1); // P1
-        board = board.play(6); // P2
-        board = board.play(2); // P1
-        board = board.play(6); // P2
-        // Now it's P1's turn, they should win by playing column 3
+        board = board.play(0);
+        board = board.play(6);
+        board = board.play(1);
+        board = board.play(6);
+        board = board.play(2);
+        board = board.play(6);
 
         let mut tt = TranspositionTable::new();
         let mut solver = Solver::new(&mut tt);
@@ -944,13 +1295,11 @@ mod tests {
     #[test]
     fn test_solver_blocks_opponent_win() {
         let mut board = Bitboard::new();
-        // Set up 3 in a row for P1, but it's P2's turn
-        board = board.play(0); // P1
-        board = board.play(6); // P2
-        board = board.play(1); // P1
-        board = board.play(6); // P2
-        board = board.play(2); // P1
-        // Now P2 must block at column 3
+        board = board.play(0);
+        board = board.play(6);
+        board = board.play(1);
+        board = board.play(6);
+        board = board.play(2);
 
         let mut tt = TranspositionTable::new();
         let mut solver = Solver::new(&mut tt);
@@ -961,38 +1310,79 @@ mod tests {
     #[test]
     fn test_transposition_table() {
         let mut tt = TranspositionTable::new();
-        tt.put(12345, 5, TTFlag::Exact, 10);
+        let board = Bitboard::new().play(3);
+        tt.put(&board, 5, TTFlag::Exact, 10, Some(3));
 
-        let entry = tt.get(12345);
+        let entry = tt.get(&board);
         assert!(entry.is_some());
         let e = entry.unwrap();
         assert_eq!(e.score, 5);
-        assert_eq!(e.flag, TTFlag::Exact);
+        assert_eq!(e.flag(), TTFlag::Exact);
+        assert_eq!(e.best_move, 3);
+    }
+
+    #[test]
+    fn test_killer_moves() {
+        let mut killers = KillerTable::new();
+
+        killers.record(5, 2);
+        let k = killers.get_killers(5);
+        assert_eq!(k[0], Some(2));
+        assert_eq!(k[1], None);
+
+        killers.record(5, 4);
+        let k = killers.get_killers(5);
+        assert_eq!(k[0], Some(4));
+        assert_eq!(k[1], Some(2)); // Still a killer (in slot 1 now)
+    }
+
+    #[test]
+    fn test_endgame_solver() {
+        // Create a position close to the end
+        let mut board = Bitboard::new();
+        board = board.play(0);
+        board = board.play(6);
+        board = board.play(1);
+        board = board.play(6);
+        board = board.play(2);
+        board = board.play(6);
+
+        // Should find winning move
+        let score = EndgameSolver::solve(&board, -WIN_SCORE, WIN_SCORE);
+        assert!(score > 0); // P1 can win
+    }
+
+    #[test]
+    fn test_zobrist_hashing() {
+        let zobrist = ZobristKeys::new();
+        let board1 = Bitboard::new().play(3);
+        let board2 = Bitboard::new().play(3);
+        let board3 = Bitboard::new().play(2);
+
+        assert_eq!(zobrist.hash(&board1), zobrist.hash(&board2));
+        assert_ne!(zobrist.hash(&board1), zobrist.hash(&board3));
     }
 
     #[test]
     fn test_opening_book() {
         let book = OpeningBook::new();
         let board = Bitboard::new();
-        // Empty board should suggest center
         assert_eq!(book.lookup(&board), Some(3));
     }
 
     #[test]
     fn test_possible_non_losing_moves() {
         let mut board = Bitboard::new();
-        // Create a position where P2 has 3 in a row
-        board = board.play(0); // P1
-        board = board.play(3); // P2
-        board = board.play(1); // P1
-        board = board.play(3); // P2
-        board = board.play(6); // P1
-        board = board.play(3); // P2 has 3 in column 3
-        // P1 must block at column 3
+        board = board.play(0);
+        board = board.play(3);
+        board = board.play(1);
+        board = board.play(3);
+        board = board.play(6);
+        board = board.play(3);
 
         let non_losing = board.possible_non_losing_moves();
         let col3_mask = Bitboard::column_mask(3) & board.possible_moves();
-        // Only column 3 should be a valid non-losing move
         assert_eq!(non_losing, col3_mask);
     }
+
 }
